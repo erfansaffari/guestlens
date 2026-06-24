@@ -455,8 +455,8 @@ export function parseLinkedInProfile(result: SerpOrganicResult, fullName: string
     snippet: rawSnippet || bio,
     description: rawDescription || bio,
     experienceSignal,
-    // thumbnail is the Google search result image — unreliable (may be a liked post or another person).
-    // Kept in the data model for future use with a verified source; not rendered in the UI.
+    // UI only renders this if it comes from *.licdn.com (LinkedIn's own CDN).
+    // Google-proxied thumbnails (gstatic.com) are skipped — they may be post images or another person.
     imageUrl: result.thumbnail || '',
     previewLimited,
   }

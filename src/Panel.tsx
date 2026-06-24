@@ -465,7 +465,7 @@ function PersonRow({
       }}
       aria-label={`Open ${person.fullName} profile`}
     >
-      <AvatarSmall name={person.fullName} colors={colors} />
+      <AvatarSmall name={person.fullName} imageUrl={profile?.imageUrl} colors={colors} />
 
       <div className="gl-person-info">
         <div className="gl-person-name">{person.fullName}</div>
@@ -493,15 +493,43 @@ function PersonRow({
   )
 }
 
+/**
+ * Only trust images served directly from LinkedIn's CDN.
+ * Google-proxied thumbnails (encrypted-tbn0.gstatic.com, etc.) can be
+ * a liked post photo or an unrelated person's image — never display those.
+ */
+function isLinkedInCdnImage(url?: string): boolean {
+  if (!url?.trim()) return false
+  try {
+    const { hostname } = new URL(url)
+    return hostname === 'media.licdn.com' || hostname.endsWith('.licdn.com')
+  } catch {
+    return false
+  }
+}
+
 /* ===================== AVATAR (small) ===================== */
 function AvatarSmall({
   name,
+  imageUrl,
   colors,
 }: {
   name: string
+  imageUrl?: string
   colors: { bg: string; fg: string; ring: string }
 }) {
+  const [broken, setBroken] = useState(false)
   const initials = getInitials(name)
+  const showImage = isLinkedInCdnImage(imageUrl) && !broken
+
+  if (showImage) {
+    return (
+      <div className="gl-avatar" style={{ background: colors.bg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}>
+        <img src={imageUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
+      </div>
+    )
+  }
+
   return (
     <div
       className="gl-avatar"
@@ -515,12 +543,25 @@ function AvatarSmall({
 /* ===================== AVATAR (large) ===================== */
 function AvatarLarge({
   name,
+  imageUrl,
   colors,
 }: {
   name: string
+  imageUrl?: string
   colors: { bg: string; fg: string; ring: string }
 }) {
+  const [broken, setBroken] = useState(false)
   const initials = getInitials(name)
+  const showImage = isLinkedInCdnImage(imageUrl) && !broken
+
+  if (showImage) {
+    return (
+      <div className="gl-avatar-lg" style={{ background: colors.bg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}>
+        <img src={imageUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
+      </div>
+    )
+  }
+
   return (
     <div
       className="gl-avatar-lg"
@@ -592,7 +633,7 @@ function ProfileInspector({
       <div className="gl-inspector-body">
         {/* Hero */}
         <div className="gl-inspector-hero">
-          <AvatarLarge name={person.fullName} colors={colors} />
+          <AvatarLarge name={person.fullName} imageUrl={profile?.imageUrl} colors={colors} />
           <div className="gl-inspector-hero-info">
             <div className="gl-inspector-name">{person.fullName}</div>
             {found && headline && headline !== 'Profile pending' && (
