@@ -493,21 +493,6 @@ function PersonRow({
   )
 }
 
-/**
- * Only trust images served directly from LinkedIn's CDN.
- * Google-proxied thumbnails (encrypted-tbn0.gstatic.com, etc.) can be
- * a liked post photo or an unrelated person's image — never display those.
- */
-function isLinkedInCdnImage(url?: string): boolean {
-  if (!url?.trim()) return false
-  try {
-    const { hostname } = new URL(url)
-    return hostname === 'media.licdn.com' || hostname.endsWith('.licdn.com')
-  } catch {
-    return false
-  }
-}
-
 /* ===================== AVATAR (small) ===================== */
 function AvatarSmall({
   name,
@@ -520,9 +505,8 @@ function AvatarSmall({
 }) {
   const [broken, setBroken] = useState(false)
   const initials = getInitials(name)
-  const showImage = isLinkedInCdnImage(imageUrl) && !broken
 
-  if (showImage) {
+  if (imageUrl?.trim() && !broken) {
     return (
       <div className="gl-avatar" style={{ background: colors.bg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}>
         <img src={imageUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
@@ -552,12 +536,12 @@ function AvatarLarge({
 }) {
   const [broken, setBroken] = useState(false)
   const initials = getInitials(name)
-  const showImage = isLinkedInCdnImage(imageUrl) && !broken
 
-  if (showImage) {
+  if (imageUrl?.trim() && !broken) {
     return (
       <div className="gl-avatar-lg" style={{ background: colors.bg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}>
         <img src={imageUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
+        {/* Google search thumbnail — usually correct for linkedin.com/in pages but unverified */}
       </div>
     )
   }

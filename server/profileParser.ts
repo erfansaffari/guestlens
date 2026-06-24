@@ -391,8 +391,13 @@ export function scoreLinkedInResult(result: SerpOrganicResult, fullName: string)
   const titleMatch = nameMatchScore(titleLead, fullName)
   score += Math.round(titleMatch * 10)
 
-  if (titleLead && titleMatch < 0.5) {
-    score -= 20
+  // Penalise only when the title lead looks like someone else's name
+  // (i.e. it contains multiple capitalised words but none match our tokens).
+  // We use a softer -5 instead of -20 because many LinkedIn titles are pure
+  // headlines with no person name at all — those shouldn't kill the score.
+  const titleHasPersonLikeName = /[A-Z][a-z]+ [A-Z][a-z]+/.test(titleLead)
+  if (titleLead && titleHasPersonLikeName && titleMatch < 0.5) {
+    score -= 15
   }
 
   if (result.link?.includes('linkedin.com/in')) score += 2
@@ -400,15 +405,29 @@ export function scoreLinkedInResult(result: SerpOrganicResult, fullName: string)
   return score
 }
 
+/**
+ * Minimum score for a result to be accepted as a profile match.
+ * A score below this means the result is likely the wrong person.
+ * - Full name match anywhere: +12, each token match: +3, linkedin.com/in: +2
+ * - Wrong-person title penalty (another person's name in title): -15
+ * - Threshold of 0 rejects results where nothing about the person matches.
+ */
+const MIN_PROFILE_SCORE = 0
+
 export function pickBestLinkedInResult(results: SerpOrganicResult[], fullName: string) {
   const linkedInResults = results.filter((result) => result.link?.includes('linkedin.com/in'))
   if (!linkedInResults.length) return null
 
-  return linkedInResults.reduce((best, current) => {
+  const best = linkedInResults.reduce((best, current) => {
     const bestScore = scoreLinkedInResult(best, fullName)
     const currentScore = scoreLinkedInResult(current, fullName)
     return currentScore > bestScore ? current : best
   })
+
+  // Reject if even the best candidate doesn't match the person's name well enough
+  if (scoreLinkedInResult(best, fullName) < MIN_PROFILE_SCORE) return null
+
+  return best
 }
 
 export function parseLinkedInProfile(result: SerpOrganicResult, fullName: string): ParsedLinkedInProfile {
