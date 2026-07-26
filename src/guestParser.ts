@@ -1,3 +1,5 @@
+import { normaliseName } from './name'
+
 export type Attendee = {
   id: string
   fullName: string
@@ -151,7 +153,7 @@ function dedupeAttendees(attendees: Attendee[]) {
   const seen = new Set<string>()
 
   return attendees.filter((attendee) => {
-    const key = attendee.fullName.toLowerCase()
+    const key = normaliseName(attendee.fullName)
     if (seen.has(key)) return false
     seen.add(key)
     return true

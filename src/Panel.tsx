@@ -1,825 +1,135 @@
-import { useEffect, useMemo, useState } from 'react'
-import {
-  askPeople,
-  enrichGuests,
-  type AskResponse,
-  type EnrichResponse,
-  type LinkedInResult,
-} from './api'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { UserButton, useAuth } from '@clerk/react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useNavigate, useParams } from 'react-router-dom'
+import { askEvent, confirmPerson, enrichImage, getAttendees, getProgress, importEvent, refreshPerson, unresolvePerson, type EventAttendee, type Person } from './api'
+import { parseGuestList, sampleLumaGuestList } from './guestParser'
 import './Panel.css'
-import { parseGuestList, sampleLumaGuestList, type Attendee } from './guestParser'
 
-type RunState = 'idle' | 'loading' | 'complete' | 'error'
-type AskState = 'idle' | 'loading' | 'complete' | 'error'
+const SEARCH_FIELDS = ['headline', 'company', 'school', 'location', 'role', 'followers', 'bio', 'snippet'] as const
 
-type Person = Attendee & {
-  linkedIn?: LinkedInResult
+function initials(name: string) {
+  return name.split(/\s+/).filter(Boolean).map((part) => part[0]).slice(0, 2).join('').toUpperCase() || '?'
 }
 
-type LocalMatch = {
-  id: string
-  reason: string
+function Avatar({ person, large = false }: { person: Person; large?: boolean }) {
+  const image = person.profile.image?.value
+  const className = large ? 'gl-avatar-lg' : 'gl-avatar'
+  return <div className={className} style={!image ? { background: '#263024', color: 'var(--accent)' } : undefined}>
+    {image ? <img src={image} alt={`${person.displayName}'s public profile`} referrerPolicy="no-referrer" /> : initials(person.displayName)}
+  </div>
 }
 
-function avatarColors(name: string) {
-  let h = 0
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360
-  return {
-    bg: `hsl(${h} 28% 19%)`,
-    fg: `hsl(${h} 52% 74%)`,
-    ring: `hsl(${h} 34% 30%)`,
-  }
+function statusText(status: Person['status']) {
+  return status === 'not_found' ? 'No public profile found' : status.replace('_', ' ')
 }
 
-function getInitials(name: string) {
-  const parts = (name || '').trim().split(/\s+/).filter(Boolean)
-  if (!parts.length) return '?'
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
+function textMatch(person: Person, query: string) {
+  const q = query.trim().toLowerCase()
+  if (!q) return null
+  if (person.displayName.toLowerCase().includes(q)) return 'name'
+  return SEARCH_FIELDS.find((field) => person.profile[field]?.value.toLowerCase().includes(q)) || null
 }
 
-function App() {
+function downloadCsv(attendees: EventAttendee[]) {
+  const headers = ['Name', 'Headline', 'Company', 'School', 'Location', 'Summary', 'LinkedIn URL']
+  const escape = (value?: string | null) => `"${(value || '').replaceAll('"', '""')}"`
+  const rows = attendees.map(({ person }) => [person.displayName, person.profile.headline?.value, person.profile.company?.value, person.profile.school?.value, person.profile.location?.value, person.profile.bio?.value || person.profile.snippet?.value, person.linkedinUrl].map(escape).join(','))
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(new Blob([headers.join(',') + '\n' + rows.join('\n')], { type: 'text/csv;charset=utf-8' }))
+  link.download = 'guestlens-network.csv'
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+function useNarrowScreen() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 1079px)').matches)
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 1079px)')
+    const update = () => setNarrow(media.matches)
+    media.addEventListener('change', update)
+    return () => media.removeEventListener('change', update)
+  }, [])
+  return narrow
+}
+
+function Inspector({ attendee, getToken, refresh, onClose }: { attendee: EventAttendee | null; getToken: () => Promise<string | null>; refresh: () => void; onClose?: () => void }) {
+  const [manualUrl, setManualUrl] = useState('')
+  const image = useMutation({ mutationFn: async (personId: string) => enrichImage(await getToken(), personId), onSuccess: refresh })
+  const profileRefresh = useMutation({ mutationFn: async (personId: string) => refreshPerson(await getToken(), personId), onSuccess: refresh })
+  const confirm = useMutation({ mutationFn: async ({ personId, candidateId, linkedinUrl }: { personId: string; candidateId?: string; linkedinUrl?: string }) => confirmPerson(await getToken(), personId, { candidateId, linkedinUrl }), onSuccess: refresh })
+  const unresolve = useMutation({ mutationFn: async (personId: string) => unresolvePerson(await getToken(), personId), onSuccess: refresh })
+  useEffect(() => {
+    if (attendee?.person.linkedinUrl && !attendee.person.profile.image?.value) image.mutate(attendee.person.id)
+  // Lazy image lookup is intentionally attached to opening an inspector.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attendee?.person.id])
+
+  if (!attendee) return <aside className="gl-inspector"><div className="gl-inspector-empty"><div className="gl-inspector-empty-icon"><span className="gl-inspector-empty-icon-dot" /></div><div className="gl-inspector-empty-title">No profile selected</div><div className="gl-inspector-empty-text">Build the network, then open a person profile from the list.</div></div></aside>
+  const person = attendee.person
+  const fields = [['Location', person.profile.location?.value], ['Company', person.profile.company?.value], ['School', person.profile.school?.value], ['Role', person.profile.role?.value], ['Followers', person.profile.followers?.value]]
+  const limited = person.profile.previewLimited?.value === 'true'
+  return <aside className="gl-inspector">
+    {onClose && <div className="gl-inspector-close-row"><button className="gl-btn-close" onClick={onClose} aria-label="Close profile">×</button></div>}
+    <div className="gl-inspector-body">
+      <div className="gl-inspector-hero"><Avatar person={person} large /><div className="gl-inspector-hero-info"><div className="gl-inspector-name">{person.displayName}</div>{person.profile.headline?.value && <div className="gl-inspector-headline">{person.profile.headline.value}</div>}<div className="gl-pending-badge"><span className="gl-pending-dot" />{statusText(person.status)}</div></div></div>
+      {fields.some(([, value]) => value) && <div className="gl-inspector-meta">{fields.filter(([, value]) => value).map(([label, value]) => <div key={label}><div className="gl-meta-label">{label}</div><div className="gl-meta-value">{value}</div></div>)}</div>}
+      {person.linkedinUrl && <a className="gl-li-btn" href={person.linkedinUrl} target="_blank" rel="noreferrer">↗ Open LinkedIn</a>}
+      {limited && <div className="gl-preview-notice"><span className="gl-preview-icon">⚠</span><div className="gl-preview-text">Google returned a limited public preview, so the bio may be incomplete.</div></div>}
+      <div className="gl-bio-section"><div className="gl-section-label">Public profile preview</div><div className={person.profile.bio?.value ? 'gl-bio-text' : 'gl-bio-empty'}>{person.profile.bio?.value || person.profile.snippet?.value || 'No public profile details are available yet.'}</div></div>
+      <div className="gl-profile-actions"><button className="gl-btn-action" onClick={() => profileRefresh.mutate(person.id)} disabled={profileRefresh.isPending}>↻ {profileRefresh.isPending ? 'Refreshing…' : 'Refresh public data'}</button>{person.linkedinUrl && !person.profile.image?.value && <button className="gl-btn-action" onClick={() => image.mutate(person.id)} disabled={image.isPending}>Find image</button>}</div>
+      {person.status === 'ambiguous' && <div className="gl-resolution"><div className="gl-section-label">Possible matches</div>{person.candidates.map((candidate) => <div className="gl-candidate" key={candidate.id}><div><a href={candidate.url} target="_blank" rel="noreferrer">{candidate.fields.headline?.value || candidate.title}</a><p>{candidate.snippet}</p><small>{candidate.score}/100 · {Object.entries(candidate.evidence).filter(([, value]) => value === true).map(([key]) => key.replace('Matched', '')).join(', ')}</small></div><button onClick={() => confirm.mutate({ personId: person.id, candidateId: candidate.id })}>Confirm</button></div>)}</div>}
+      {!person.userConfirmed && <form className="gl-manual-confirm" onSubmit={(event) => { event.preventDefault(); confirm.mutate({ personId: person.id, linkedinUrl: manualUrl }) }}><input value={manualUrl} onChange={(event) => setManualUrl(event.target.value)} placeholder="Paste canonical LinkedIn URL" /><button disabled={!manualUrl || confirm.isPending}>Confirm URL</button></form>}
+      <button className="gl-unresolve" onClick={() => unresolve.mutate(person.id)} disabled={unresolve.isPending}>Mark unresolved</button>
+      {(confirm.error || unresolve.error || profileRefresh.error) && <p className="gl-error-text">{(confirm.error || unresolve.error || profileRefresh.error)?.message}</p>}
+    </div>
+  </aside>
+}
+
+function Dashboard() {
+  const { getToken } = useAuth()
+  const navigate = useNavigate(); const { eventId: routeEventId } = useParams()
+  const client = useQueryClient()
+  const narrow = useNarrowScreen()
   const [guestText, setGuestText] = useState('')
   const [eventContext, setEventContext] = useState('')
-  const [runState, setRunState] = useState<RunState>('idle')
-  const [askState, setAskState] = useState<AskState>('idle')
-  const [error, setError] = useState('')
-  const [result, setResult] = useState<EnrichResponse | null>(null)
+  const [eventId, setEventId] = useState<string | null>(routeEventId || null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [question, setQuestion] = useState('')
-  const [answer, setAnswer] = useState<AskResponse | null>(null)
-  const [drawerOpen, setDrawerOpen] = useState(false)
-  const [isNarrow, setIsNarrow] = useState(false)
-  const [askFocused, setAskFocused] = useState(false)
-
-  useEffect(() => {
-    const onResize = () => {
-      const narrow = window.innerWidth < 1080
-      setIsNarrow((prev) => {
-        if (narrow !== prev) {
-          if (!narrow) setDrawerOpen(false)
-          return narrow
-        }
-        return prev
-      })
-    }
-    window.addEventListener('resize', onResize)
-    onResize()
-    return () => window.removeEventListener('resize', onResize)
-  }, [])
-
+  const [query, setQuery] = useState('')
+  const [aiAnswer, setAiAnswer] = useState<{ answer: string; matches: Map<string, string> } | null>(null)
+  const [error, setError] = useState('')
   const attendees = useMemo(() => parseGuestList(guestText), [guestText])
-  const linkedInById = useMemo(
-    () => new Map(result?.linkedIn.map((item) => [item.attendeeId, item]) || []),
-    [result],
-  )
-
-  const people = useMemo<Person[]>(() => {
-    return attendees.map((attendee) => ({
-      ...attendee,
-      linkedIn: linkedInById.get(attendee.id),
-    }))
-  }, [attendees, linkedInById])
-
-  const localMatches = useMemo(() => getLocalMatches(people, question), [people, question])
-  const localMatchById = useMemo(
-    () => new Map(localMatches.map((match) => [match.id, match])),
-    [localMatches],
-  )
-  const aiMatchById = useMemo(
-    () => new Map(answer?.matches.map((match) => [match.id, match]) || []),
-    [answer],
-  )
-
-  const activeSearch = question.trim().length > 0
-
-  const visiblePeople = useMemo(() => {
-    if (!activeSearch) return people
-    const orderedIds = new Set<string>()
-    localMatches.forEach((match) => orderedIds.add(match.id))
-    answer?.matches.forEach((match) => orderedIds.add(match.id))
-    return people.filter((person) => orderedIds.has(person.id))
-  }, [activeSearch, answer, localMatches, people])
-
-  const selectedPerson = people.find((person) => person.id === selectedId)
-
-  const built = runState === 'complete'
-  const building = runState === 'loading'
-  const linkedInUnavailable = Boolean(result && result.search && !result.search.ok)
-
-  async function handleEnrich() {
-    if (building || !attendees.length) return
-    setRunState('loading')
-    setError('')
-    setAnswer(null)
-
-    try {
-      const response = await enrichGuests(attendees, eventContext)
-      setResult(response)
-      setRunState('complete')
-      setSelectedId((current) => current || attendees[0]?.id || null)
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Something went wrong.')
-      setRunState('error')
-    }
-  }
-
-  async function handleAsk() {
-    if (!question.trim() || !people.length || !result) return
-    setAskState('loading')
-
-    try {
-      const response = await askPeople(
-        question,
-        people.map((person) => ({
-          id: person.id,
-          fullName: person.fullName,
-          sourceContext: [person.company, person.title, person.location].filter(Boolean).join(' · '),
-          profile: person.linkedIn?.profile || null,
-        })),
-      )
-      setAnswer(response)
-      setAskState('complete')
-      setSelectedId(response.matches[0]?.id || selectedPerson?.id || visiblePeople[0]?.id || null)
-    } catch {
-      setAskState('idle')
-    }
-  }
-
-  function handleQuestionChange(value: string) {
-    setQuestion(value)
-    setAnswer(null)
-    setAskState('idle')
-  }
-
-  function selectPerson(id: string) {
-    setSelectedId(id)
-    if (isNarrow) setDrawerOpen(true)
-  }
-
-  function handleClear() {
-    setGuestText('')
-    setResult(null)
-    setAnswer(null)
-    setQuestion('')
-    setSelectedId(null)
-    setDrawerOpen(false)
-    setRunState('idle')
-  }
-
-  function exportCsv() {
-    const rows = [
-      ['Name', 'Headline', 'Company', 'School', 'Location', 'Summary', 'LinkedIn'],
-      ...people.map((person) => [
-        person.fullName,
-        profileTitle(person),
-        person.linkedIn?.profile?.company || '',
-        person.linkedIn?.profile?.school || '',
-        person.linkedIn?.profile?.location || '',
-        person.linkedIn?.profile?.bio || person.linkedIn?.profile?.summary || person.linkedIn?.profile?.description || '',
-        person.linkedIn?.profile?.url || '',
-      ]),
-    ]
-    const csv = rows
-      .map((row) => row.map((cell) => `"${cell.replaceAll('"', '""')}"`).join(','))
-      .join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = 'networking-people.csv'
-    link.click()
-    URL.revokeObjectURL(url)
-  }
-
-  const stats = result ? buildStats(result, people, linkedInUnavailable) : []
-
-  const countBadge = built
-    ? activeSearch
-      ? `${visiblePeople.length} shown`
-      : `${people.length} shown${result?.cache && result.cache.hits > 0 ? ` · ${result.cache.hits} from cache` : ''}`
-    : ''
-
-  return (
-    <main className="app-shell">
-      {/* HEADER */}
-      <header className="gl-header">
-        <div className="gl-logo">
-          <div className="gl-logo-icon">
-            <div className="gl-logo-dot" />
-          </div>
-          <div className="gl-logo-name">
-            Guest<span>Lens</span>
-          </div>
-          <div className="gl-logo-tagline">// find the right people to meet</div>
-        </div>
-        <div className="gl-header-actions">
-          <button
-            type="button"
-            className="gl-btn-ghost"
-            onClick={() => setGuestText(sampleLumaGuestList)}
-          >
-            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: 'var(--accent)' }}>↘</span>
-            Luma sample
-          </button>
-          <button
-            type="button"
-            className="gl-btn-accent"
-            onClick={handleEnrich}
-            disabled={!attendees.length || building}
-          >
-            {building && <span className="gl-spinner-dark" />}
-            {building ? 'Building…' : 'Build network'}
-          </button>
-        </div>
-      </header>
-
-      {/* STATS STRIP */}
-      {built && stats.length > 0 && (
-        <div className="gl-stats">
-          {stats.map((stat) => (
-            <div key={stat.label} className="gl-stat-cell">
-              <div className="gl-stat-label">{stat.label}</div>
-              <div className={`gl-stat-value${stat.warn ? ' warn' : ''}`}>{stat.value}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* MAIN THREE COLUMNS */}
-      <div className="gl-main">
-        {/* SOURCE PANEL */}
-        <div className="gl-source">
-          <div className="gl-panel-header">
-            <div className="gl-panel-title">Source</div>
-            <div className="gl-panel-count">{attendees.length} names</div>
-          </div>
-
-          <div className="gl-source-body">
-            <div className="gl-field-label">Event context</div>
-            <input
-              className="gl-input"
-              value={eventContext}
-              onChange={(e) => setEventContext(e.target.value)}
-              placeholder="Waterloo, ON (optional — defaults to Canada)"
-            />
-
-            <div className="gl-field-label gl-field-gap">Guest list</div>
-            <div className="gl-textarea-wrap">
-              <textarea
-                className="gl-textarea"
-                value={guestText}
-                onChange={(e) => {
-                  setGuestText(e.target.value)
-                  setResult(null)
-                  setAnswer(null)
-                  setQuestion('')
-                  setSelectedId(null)
-                  setRunState('idle')
-                }}
-                placeholder="Paste the Luma guest list here..."
-              />
-            </div>
-
-            {runState === 'error' && error && (
-              <div className="gl-error-box">
-                <span className="gl-error-icon">✕</span>
-                <div className="gl-error-text">{error}</div>
-              </div>
-            )}
-
-            {linkedInUnavailable && (
-              <div className="gl-warning-box">
-                <div className="gl-warning-title">
-                  <span>⚠</span> LinkedIn lookup unavailable
-                </div>
-                <div className="gl-warning-text">
-                  SerpAPI key missing or quota exhausted. Guests still parse from your paste, but profiles can't be enriched.
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="gl-source-actions">
-            <button type="button" className="gl-btn-clear" onClick={handleClear}>
-              ✕ Clear
-            </button>
-            <button
-              type="button"
-              className="gl-btn-action"
-              onClick={exportCsv}
-              disabled={!built}
-            >
-              ↧ Export CSV
-            </button>
-          </div>
-        </div>
-
-        {/* PEOPLE PANEL */}
-        <div className="gl-people">
-          <div className="gl-search-area">
-            <div className={`gl-search-bar${askFocused ? ' focused' : ''}`}>
-              <div className="gl-search-icon">
-                <div className="gl-search-icon-dot" />
-              </div>
-              <input
-                className="gl-search-input"
-                value={question}
-                onChange={(e) => handleQuestionChange(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleAsk() }}
-                onFocus={() => setAskFocused(true)}
-                onBlur={() => setAskFocused(false)}
-                disabled={!built}
-                placeholder="Ask: who studies CS, who is a founder, who works in AI…  ·  type to filter"
-              />
-              <button
-                type="button"
-                className="gl-ask-btn"
-                onClick={handleAsk}
-                disabled={!built || !question.trim() || askState === 'loading'}
-              >
-                {askState === 'loading' && <span className="gl-ask-spinner" />}
-                Ask AI
-              </button>
-            </div>
-            <div className="gl-search-hint">
-              type to filter instantly  ·  press ↵ or Ask AI for semantic matches
-            </div>
-          </div>
-
-          {answer && (
-            <div className="gl-ai-answer">
-              <div className="gl-ai-answer-header">
-                <span className="gl-ai-answer-label">◇ AI</span>
-                {answer.matches.length > 0
-                  ? `  ${answer.matches.length} AI suggested`
-                  : '  No AI-only matches'}
-              </div>
-              <div className="gl-ai-answer-text">{answer.answer}</div>
-            </div>
-          )}
-
-          <div className="gl-list-header">
-            <div className="gl-list-title">{activeSearch ? 'Search results' : 'People'}</div>
-            {countBadge && <div className="gl-list-count">{countBadge}</div>}
-          </div>
-
-          <div className="gl-list">
-            {!attendees.length ? (
-              <div className="gl-empty">
-                <div className="gl-empty-icon-box">⌑</div>
-                <div className="gl-empty-title">Paste a guest list to start.</div>
-                <div className="gl-empty-text">
-                  Drop in a Luma guest list, then hit{' '}
-                  <strong>Build network</strong>. People appear here with photos, headlines and LinkedIn links — searchable as you type.
-                </div>
-              </div>
-            ) : activeSearch && !visiblePeople.length ? (
-              <div className="gl-empty gl-search-empty">
-                <div className="gl-empty-title">No text matches for "{question}".</div>
-                <div className="gl-empty-text" style={{ maxWidth: 280 }}>
-                  Press ↵ to ask AI for semantic matches across the directory, or refine your filter.
-                </div>
-              </div>
-            ) : (
-              <div className="gl-list-inner">
-                {visiblePeople.map((person) => (
-                  <PersonRow
-                    key={person.id}
-                    person={person}
-                    selected={person.id === selectedId}
-                    matchReason={getMatchReason(person.id, localMatchById, aiMatchById)}
-                    hasProfile={built && !linkedInUnavailable}
-                    onSelect={() => selectPerson(person.id)}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* PROFILE INSPECTOR (desktop) */}
-        {!isNarrow && (
-          <div className="gl-profile-col">
-            <ProfileInspector person={selectedPerson} built={built && !linkedInUnavailable} />
-          </div>
-        )}
-      </div>
-
-      {/* DRAWER (mobile) */}
-      {drawerOpen && selectedPerson && (
-        <div
-          className="gl-drawer-backdrop"
-          role="presentation"
-          onClick={() => setDrawerOpen(false)}
-        >
-          <div
-            className="gl-drawer"
-            role="dialog"
-            aria-modal="true"
-            aria-label={`${selectedPerson.fullName} profile`}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <ProfileInspector
-              person={selectedPerson}
-              built={built && !linkedInUnavailable}
-              showClose
-              onClose={() => setDrawerOpen(false)}
-            />
-          </div>
-        </div>
-      )}
-    </main>
-  )
-}
-
-/* ===================== PERSON ROW ===================== */
-function PersonRow({
-  person,
-  selected,
-  matchReason,
-  hasProfile,
-  onSelect,
-}: {
-  person: Person
-  selected: boolean
-  matchReason?: string
-  hasProfile: boolean
-  onSelect: () => void
-}) {
-  const profile = person.linkedIn?.profile
-  const found = hasProfile && Boolean(profile?.url)
-  const colors = avatarColors(person.fullName)
-  const subtitle = found
-    ? profile?.headline || profile?.company || 'Profile found'
-    : 'Profile pending'
-
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      className={`gl-person-row${selected ? ' selected' : ''}`}
-      onClick={onSelect}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect() }
-      }}
-      aria-label={`Open ${person.fullName} profile`}
-    >
-      <AvatarSmall name={person.fullName} imageUrl={profile?.imageUrl} colors={colors} />
-
-      <div className="gl-person-info">
-        <div className="gl-person-name">{person.fullName}</div>
-        <div className="gl-person-subtitle">{subtitle}</div>
-        {matchReason && <div className="gl-badge">{matchReason}</div>}
-      </div>
-
-      <div className="gl-person-end">
-        {found
-          ? <span className="gl-status-found" title="LinkedIn found" />
-          : <span className="gl-status-pending" title="Profile pending" />
-        }
-        <a
-          href={profile?.url || `https://www.linkedin.com/search/results/all/?keywords=${encodeURIComponent(person.fullName)}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="gl-li-link"
-          title="LinkedIn"
-          onClick={(e) => e.stopPropagation()}
-        >
-          ↗
-        </a>
-      </div>
+  const attendeeQuery = useQuery({ queryKey: ['attendees', eventId], queryFn: async () => getAttendees(await getToken(), eventId!), enabled: Boolean(eventId), refetchInterval: eventId ? 12_000 : false })
+  const progressQuery = useQuery({ queryKey: ['progress', eventId], queryFn: async () => getProgress(await getToken(), eventId!), enabled: Boolean(eventId), refetchInterval: eventId ? 5_000 : false })
+  const refresh = useCallback(() => { void client.invalidateQueries({ queryKey: ['attendees', eventId] }); void client.invalidateQueries({ queryKey: ['progress', eventId] }) }, [client, eventId])
+  useEffect(() => { if (!eventId) return; const stream = new EventSource(`/api/events/${eventId}/stream`); stream.addEventListener('person.updated', refresh); return () => stream.close() }, [eventId, refresh])
+  useEffect(() => { setEventId(routeEventId || null); setSelectedId(null) }, [routeEventId])
+  useEffect(() => { if (!routeEventId || !attendeeQuery.data) return; setEventContext(attendeeQuery.data.event.context || ''); setGuestText(attendeeQuery.data.attendees.map((attendee) => attendee.originalName).join('\n')) }, [routeEventId, attendeeQuery.data])
+  const importer = useMutation({ mutationFn: async () => importEvent(await getToken(), eventContext.trim() || 'Untitled event', attendees, eventContext), onSuccess: (result) => { setEventId(result.eventId); navigate(`/app/events/${result.eventId}`); setSelectedId(null); setError('') }, onError: (caught) => setError(caught.message) })
+  const ask = useMutation({ mutationFn: async () => askEvent(await getToken(), eventId!, query), onSuccess: (result) => setAiAnswer({ answer: result.answer, matches: new Map(result.matches.map((match) => [match.personId, match.reason])) }), onError: (caught) => setError(caught.message) })
+  const current = attendeeQuery.data?.attendees || []
+  const shown = current.filter(({ person }) => { const local = textMatch(person, query); return !query.trim() || Boolean(local) || Boolean(aiAnswer?.matches.has(person.id)) })
+  const selected = current.find(({ person }) => person.id === selectedId) || null
+  const progress = progressQuery.data
+  const stats = eventId ? [['Guests', String(progress?.total ?? current.length)], ['Profiles confirmed', String(progress?.resolved ?? 0)], ['Processing', String(progress?.pending ?? 0)], ['Needs review', String((progress?.ambiguous ?? 0) + (progress?.failed ?? 0) + (progress?.budgetPaused ?? 0))]] : []
+  const clear = () => { setGuestText(''); setEventContext(''); setEventId(null); setSelectedId(null); setQuery(''); setAiAnswer(null); setError(''); navigate('/app/events/new') }
+  return <main className="app-shell">
+    <header className="gl-header"><div className="gl-logo"><div className="gl-logo-icon"><div className="gl-logo-dot" /></div><div className="gl-logo-name">Guest<span>Lens</span></div><div className="gl-logo-tagline">// event workspace</div></div><div className="gl-header-actions"><button className="gl-btn-ghost" onClick={() => navigate('/app')}>← Dashboard</button><button className="gl-btn-ghost" onClick={() => setGuestText(sampleLumaGuestList)}>↘ Luma sample</button><button className="gl-btn-accent" disabled={!attendees.length || importer.isPending} onClick={() => importer.mutate()}>{importer.isPending ? 'Building…' : 'Build network'}</button><UserButton /></div></header>
+    {stats.length > 0 && <section className="gl-stats">{stats.map(([label, value]) => <div className="gl-stat-cell" key={label}><div className="gl-stat-label">{label}</div><div className="gl-stat-value">{value}</div></div>)}</section>}
+    <div className="gl-main">
+      <aside className="gl-source"><div className="gl-panel-header"><div className="gl-panel-title">Source</div><div className="gl-panel-count">{attendees.length} names</div></div><div className="gl-source-body"><label className="gl-field-label">Event context</label><input className="gl-input" value={eventContext} onChange={(event) => setEventContext(event.target.value)} placeholder="Waterloo, ON (optional — defaults to Canada)" /><label className="gl-field-label gl-field-gap">Guest list</label><div className="gl-textarea-wrap"><textarea className="gl-textarea" value={guestText} onChange={(event) => { setGuestText(event.target.value); setAiAnswer(null) }} placeholder="Paste the Luma guest list here..." /></div>{error && <div className="gl-error-box"><span className="gl-error-icon">×</span><div className="gl-error-text">{error}</div></div>}</div><div className="gl-source-actions"><button className="gl-btn-clear" onClick={clear}>× Clear</button><button className="gl-btn-action" disabled={!eventId || !current.length} onClick={() => downloadCsv(current)}>↧ Export CSV</button></div></aside>
+      <section className="gl-people"><div className="gl-search-area"><div className="gl-search-bar"><div className="gl-search-icon"><div className="gl-search-icon-dot" /></div><input className="gl-search-input" value={query} onChange={(event) => { setQuery(event.target.value); setAiAnswer(null) }} onKeyDown={(event) => { if (event.key === 'Enter' && eventId && query.trim()) ask.mutate() }} disabled={!eventId} placeholder="Ask: who studies CS, who is a founder, who works in AI…  ·  type to filter" /><button className="gl-ask-btn" disabled={!eventId || !query.trim() || ask.isPending} onClick={() => ask.mutate()}>{ask.isPending && <span className="gl-ask-spinner" />}Ask AI</button></div><div className="gl-search-hint">type to filter instantly · press ↵ or Ask AI for semantic matches</div></div>
+        {aiAnswer && <div className="gl-ai-answer"><div className="gl-ai-answer-header"><span className="gl-ai-answer-label">◇ AI</span>{aiAnswer.matches.size ? `${aiAnswer.matches.size} AI suggested` : 'No AI-only matches'}</div><div className="gl-ai-answer-text">{aiAnswer.answer}</div></div>}
+        <div className="gl-list-header"><div className="gl-list-title">{query.trim() ? 'Search results' : 'People'}</div><div className="gl-list-count">{eventId ? `${shown.length} shown` : 'Paste a guest list'}</div></div>
+        <div className="gl-list">{attendeeQuery.isLoading ? <div className="gl-list-inner">{Array.from({ length: 6 }, (_, index) => <div className="gl-skeleton" key={index} />)}</div> : !eventId ? <div className="gl-empty"><div className="gl-empty-icon-box">⌑</div><div className="gl-empty-title">Paste a guest list to start.</div><div className="gl-empty-text">Drop in a Luma guest list, then hit <strong>Build network</strong>. People appear here with photos, headlines and LinkedIn links.</div></div> : !shown.length ? <div className="gl-empty gl-search-empty"><div className="gl-empty-title">No text matches for “{query}”.</div><div className="gl-empty-text">Press ↵ to ask AI across the directory, or refine your filter.</div></div> : <div className="gl-list-inner">{shown.map((attendee) => { const local = textMatch(attendee.person, query); const aiReason = aiAnswer?.matches.get(attendee.person.id); return <button className={`gl-person-row${selectedId === attendee.person.id ? ' selected' : ''}`} key={attendee.attendeeId} onClick={() => setSelectedId(attendee.person.id)}><Avatar person={attendee.person} /><div className="gl-person-info"><div className="gl-person-name">{attendee.person.displayName}</div><div className="gl-person-subtitle">{attendee.person.profile.headline?.value || attendee.person.profile.company?.value || (attendee.person.status === 'pending' ? 'Searching public sources…' : statusText(attendee.person.status))}</div>{(aiReason || local) && <div className="gl-badge">{aiReason ? `AI · ${aiReason}` : `match · ${local}`}</div>}</div><div className="gl-person-end">{attendee.person.status === 'resolved' ? <span className="gl-status-found" title="Profile found" /> : <span className="gl-status-pending" title={statusText(attendee.person.status)} />}{attendee.person.linkedinUrl && <a className="gl-li-link" href={attendee.person.linkedinUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()} aria-label={`Open ${attendee.person.displayName} on LinkedIn`}>↗</a>}</div></button> })}</div>}</div>
+      </section>
+      <aside className="gl-profile-col"><Inspector attendee={selected} getToken={getToken} refresh={refresh} /></aside>
     </div>
-  )
+    {narrow && selected && <div className="gl-drawer-backdrop" onClick={() => setSelectedId(null)}><div className="gl-drawer" onClick={(event) => event.stopPropagation()}><Inspector attendee={selected} getToken={getToken} refresh={refresh} onClose={() => setSelectedId(null)} /></div></div>}
+  </main>
 }
 
-/* ===================== AVATAR (small) ===================== */
-function AvatarSmall({
-  name,
-  imageUrl,
-  colors,
-}: {
-  name: string
-  imageUrl?: string
-  colors: { bg: string; fg: string; ring: string }
-}) {
-  const [broken, setBroken] = useState(false)
-  const initials = getInitials(name)
-
-  if (imageUrl?.trim() && !broken) {
-    return (
-      <div className="gl-avatar" style={{ background: colors.bg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}>
-        <img src={imageUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
-      </div>
-    )
-  }
-
-  return (
-    <div
-      className="gl-avatar"
-      style={{ background: colors.bg, color: colors.fg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}
-    >
-      {initials}
-    </div>
-  )
+export default function Panel() {
+  if (!import.meta.env.VITE_CLERK_PUBLISHABLE_KEY) return <main className="gl-route-loading">Set VITE_CLERK_PUBLISHABLE_KEY to enable GuestLens.</main>
+  return <Dashboard />
 }
-
-/* ===================== AVATAR (large) ===================== */
-function AvatarLarge({
-  name,
-  imageUrl,
-  colors,
-}: {
-  name: string
-  imageUrl?: string
-  colors: { bg: string; fg: string; ring: string }
-}) {
-  const [broken, setBroken] = useState(false)
-  const initials = getInitials(name)
-
-  if (imageUrl?.trim() && !broken) {
-    return (
-      <div className="gl-avatar-lg" style={{ background: colors.bg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}>
-        <img src={imageUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
-        {/* Google search thumbnail — usually correct for linkedin.com/in pages but unverified */}
-      </div>
-    )
-  }
-
-  return (
-    <div
-      className="gl-avatar-lg"
-      style={{ background: colors.bg, color: colors.fg, boxShadow: `0 0 0 1px ${colors.ring} inset` }}
-    >
-      {initials}
-    </div>
-  )
-}
-
-/* ===================== PROFILE INSPECTOR ===================== */
-function ProfileInspector({
-  person,
-  built,
-  showClose,
-  onClose,
-}: {
-  person?: Person
-  built: boolean
-  showClose?: boolean
-  onClose?: () => void
-}) {
-  if (!person) {
-    return (
-      <div className="gl-inspector">
-        {showClose && (
-          <div className="gl-inspector-close-row">
-            <button type="button" className="gl-btn-close" onClick={onClose}>✕</button>
-          </div>
-        )}
-        <div className="gl-inspector-empty">
-          <div className="gl-inspector-empty-icon">
-            <div className="gl-inspector-empty-icon-dot" />
-          </div>
-          <div className="gl-inspector-empty-title">No profile selected</div>
-          <div className="gl-inspector-empty-text">
-            Build the network, then open a person from the list to inspect their profile.
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  const profile = person.linkedIn?.profile
-  const found = built && Boolean(profile?.url)
-  const colors = avatarColors(person.fullName)
-  const headline = profileTitle(person)
-  const bio = profile?.bio || profile?.summary || profile?.description || profile?.snippet || ''
-
-  const metaRows: { label: string; value: string }[] = []
-  if (found) {
-    if (profile?.location) metaRows.push({ label: 'Location', value: profile.location })
-    if (profile?.company) metaRows.push({ label: 'Company', value: profile.company })
-    if (profile?.school) metaRows.push({ label: 'School', value: profile.school })
-    if (profile?.role) metaRows.push({ label: 'Role', value: profile.role })
-    if (profile?.followers) metaRows.push({ label: 'Followers', value: profile.followers + ' followers' })
-  }
-
-  const guestParts = [person.company, person.title, person.location].filter(Boolean)
-
-  return (
-    <div className="gl-inspector">
-      {showClose && (
-        <div className="gl-inspector-close-row">
-          <button type="button" className="gl-btn-close" onClick={onClose}>✕</button>
-        </div>
-      )}
-
-      <div className="gl-inspector-body">
-        {/* Hero */}
-        <div className="gl-inspector-hero">
-          <AvatarLarge name={person.fullName} imageUrl={profile?.imageUrl} colors={colors} />
-          <div className="gl-inspector-hero-info">
-            <div className="gl-inspector-name">{person.fullName}</div>
-            {found && headline && headline !== 'Profile pending' && (
-              <div className="gl-inspector-headline">{headline}</div>
-            )}
-            {!found && (
-              <div className="gl-pending-badge">
-                <span className="gl-pending-dot" />
-                PROFILE PENDING
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Meta rows */}
-        {metaRows.length > 0 && (
-          <div className="gl-inspector-meta">
-            {metaRows.map((row) => (
-              <div key={row.label}>
-                <div className="gl-meta-label">{row.label}</div>
-                <div className="gl-meta-value">{row.value}</div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* LinkedIn button */}
-        {found && profile?.url && (
-          <a
-            className="gl-li-btn"
-            href={profile.url}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Open LinkedIn <span style={{ fontSize: 13 }}>↗</span>
-          </a>
-        )}
-
-        {/* Preview limited notice */}
-        {found && profile?.previewLimited && (
-          <div className="gl-preview-notice">
-            <span className="gl-preview-icon">◷</span>
-            <div className="gl-preview-text">
-              Preview limited — Google returned a partial snippet. The full LinkedIn bio wasn't available from search.
-            </div>
-          </div>
-        )}
-
-        {/* Bio */}
-        {found && (
-          <div className="gl-bio-section">
-            <div className="gl-section-label">Bio</div>
-            {bio
-              ? <div className="gl-bio-text">{bio}</div>
-              : <div className="gl-bio-empty">No public LinkedIn bio found from search results.</div>
-            }
-          </div>
-        )}
-
-        {/* From guest list */}
-        {guestParts.length > 0 && (
-          <div className="gl-guest-section">
-            <div className="gl-section-label">From guest list</div>
-            <div className="gl-guest-text">{guestParts.join('   ·   ')}</div>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/* ===================== HELPERS ===================== */
-function profileTitle(person: Person) {
-  const raw =
-    person.linkedIn?.profile?.headline ||
-    person.linkedIn?.profile?.title ||
-    person.title ||
-    person.company ||
-    'Profile pending'
-  return raw.replace(/\s*-\s*LinkedIn\s*$/i, '').replace(/\s*\|\s*LinkedIn\s*$/i, '')
-}
-
-function buildStats(
-  result: EnrichResponse,
-  people: Person[],
-  linkedInUnavailable: boolean,
-) {
-  const stats = result.stats
-  const profilesFound = linkedInUnavailable
-    ? 0
-    : (stats?.profilesFound ?? result.linkedIn.filter((e) => e.profile?.url).length)
-  const total = stats?.guests ?? result.linkedIn.length
-  const cacheHits = stats?.cacheHits ?? result.cache?.hits ?? 0
-  const cacheMisses = stats?.cacheMisses ?? result.cache?.misses ?? 0
-  const { aggregate } = result
-
-  const m = aggregate?.men ?? people.filter((p) => {
-    const n = p.fullName.split(' ')[0]?.toLowerCase() || ''
-    return maleFirstNames.has(n)
-  }).length
-  const f = aggregate?.women ?? people.filter((p) => {
-    const n = p.fullName.split(' ')[0]?.toLowerCase() || ''
-    return femaleFirstNames.has(n)
-  }).length
-  const u = aggregate?.unknown ?? (total - m - f)
-
-  return [
-    { label: 'Guests', value: String(total), warn: false },
-    {
-      label: 'LinkedIn found',
-      value: `${profilesFound} / ${total}`,
-      warn: linkedInUnavailable || profilesFound === 0,
-    },
-    {
-      label: 'Serp cache',
-      value: linkedInUnavailable
-        ? 'unavailable'
-        : cacheHits > 0
-          ? `${cacheHits} hit · ${cacheMisses} new`
-          : `${cacheMisses} searched`,
-      warn: linkedInUnavailable,
-    },
-    { label: 'Name estimate', value: `${m}M · ${f}F · ${u}?`, warn: false },
-  ]
-}
-
-const maleFirstNames = new Set([
-  'james','john','robert','michael','william','david','richard','charles',
-  'joseph','thomas','christopher','daniel','paul','mark','donald','george',
-  'kenneth','steven','edward','brian','ronald','anthony','kevin','jason',
-  'matthew','gary','timothy','jose','larry','jeffrey','frank','scott',
-  'eric','stephen','andrew','raymond','gregory','joshua','jerry','dennis',
-  'ryan','patrick','peter','samuel','jack','liam','noah','oliver','elijah',
-  'amir','aman','ammar','anas','andres','andrew','andy','alex',
-])
-
-const femaleFirstNames = new Set([
-  'mary','patricia','linda','barbara','elizabeth','jennifer','maria','susan',
-  'margaret','dorothy','lisa','nancy','karen','betty','helen','sandra',
-  'donna','carol','ruth','sharon','michelle','laura','sarah','kimberly',
-  'deborah','jessica','shirley','cynthia','angela','melissa','brenda',
-  'amy','anna','rebecca','virginia','kathleen','pamela','martha','debra',
-  'amanda','stephanie','carolyn','emma','olivia','ava','isabella','sophia',
-  'mia','charlotte','amelia','ana','anastasiia','angela',
-])
-
-function getLocalMatches(people: Person[], query: string): LocalMatch[] {
-  const tokens = normalizeSearchText(query).split(' ').filter(Boolean)
-  if (!tokens.length) return []
-
-  return people
-    .map((person) => {
-      const fields = personSearchFields(person)
-      const searchable = fields.map((f) => f.normalized).join(' ')
-      const matched = tokens.every((token) => searchable.includes(token))
-      if (!matched) return null
-
-      const strongestField =
-        fields.find((f) => tokens.some((token) => f.normalized.includes(token)))?.label ||
-        'profile context'
-
-      return { id: person.id, reason: `match · ${strongestField}` }
-    })
-    .filter((m): m is LocalMatch => Boolean(m))
-}
-
-function getMatchReason(
-  personId: string,
-  localMatchById: Map<string, LocalMatch>,
-  aiMatchById: Map<string, { id: string; reason: string }>,
-) {
-  const local = localMatchById.get(personId)
-  if (local) return local.reason
-
-  const ai = aiMatchById.get(personId)
-  if (ai) return `AI · ${ai.reason}`
-
-  return undefined
-}
-
-function personSearchFields(person: Person) {
-  const profile = person.linkedIn?.profile
-  return [
-    { label: 'name', value: person.fullName },
-    { label: 'source context', value: [person.company, person.title, person.location].filter(Boolean).join(' ') },
-    { label: 'headline', value: profileTitle(person) },
-    { label: 'company', value: profile?.company || '' },
-    { label: 'school', value: profile?.school || '' },
-    { label: 'location', value: profile?.location || '' },
-    { label: 'role', value: profile?.role || '' },
-    { label: 'bio', value: profile?.bio || profile?.summary || profile?.description || profile?.snippet || '' },
-    { label: 'experience', value: profile?.experienceSignal || '' },
-  ].map((field) => ({ ...field, normalized: normalizeSearchText(field.value) }))
-}
-
-function normalizeSearchText(value: string) {
-  return value
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim()
-}
-
-export default App

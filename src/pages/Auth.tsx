@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { SignIn, SignUp } from '@clerk/react'
+import { Link, useLocation } from 'react-router-dom'
 import '../public.css'
 
 const AUTH_POINTS = [
@@ -9,19 +9,8 @@ const AUTH_POINTS = [
 ]
 
 export default function Auth() {
-  const navigate = useNavigate()
   const { pathname } = useLocation()
-  const initialMode = pathname === '/signin' ? 'signin' : 'signup'
-  const [mode, setMode] = useState<'signin' | 'signup'>(initialMode)
-  const [email, setEmail] = useState('')
-
-  const isSignUp = mode === 'signup'
-
-  function handleContinue(e: React.FormEvent) {
-    e.preventDefault()
-    // No real auth — redirect to onboarding (which goes to app)
-    navigate('/onboarding')
-  }
+  const isSignUp = pathname.startsWith('/signup')
 
   return (
     <div style={{ minHeight: '100vh', background: '#08090B', color: '#EDEFF2', fontFamily: "'Schibsted Grotesk', system-ui, sans-serif" }}>
@@ -49,21 +38,6 @@ export default function Auth() {
         {/* FORM SIDE */}
         <div className="pub-auth-form-side">
           <div className="pub-auth-form-wrap">
-            <div className="pub-auth-tabs">
-              <button
-                className={`pub-auth-tab${mode === 'signin' ? ' active' : ''}`}
-                onClick={() => setMode('signin')}
-              >
-                Sign in
-              </button>
-              <button
-                className={`pub-auth-tab${mode === 'signup' ? ' active' : ''}`}
-                onClick={() => setMode('signup')}
-              >
-                Sign up
-              </button>
-            </div>
-
             <h2 className="pub-auth-h2">
               {isSignUp ? 'Create your account' : 'Welcome back'}
             </h2>
@@ -73,30 +47,7 @@ export default function Auth() {
                 : 'Sign in to pick up where you left off.'}
             </p>
 
-            {/* Google button — redirects straight to onboarding */}
-            <button className="pub-auth-google-btn" onClick={() => navigate('/onboarding')}>
-              <span className="pub-auth-google-g">G</span> Continue with Google
-            </button>
-
-            <div className="pub-auth-divider">
-              <div className="pub-auth-divider-line" />
-              <span className="pub-auth-divider-text">OR</span>
-              <div className="pub-auth-divider-line" />
-            </div>
-
-            <form onSubmit={handleContinue}>
-              <div className="pub-auth-field-label">Email</div>
-              <input
-                className="pub-auth-input"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@company.com"
-              />
-              <button type="submit" className="pub-auth-submit">
-                {isSignUp ? 'Create account' : 'Sign in'}
-              </button>
-            </form>
+            {isSignUp ? <SignUp routing="path" path="/signup" signInUrl="/signin" fallbackRedirectUrl="/app" /> : <SignIn routing="path" path="/signin" signUpUrl="/signup" fallbackRedirectUrl="/app" />}
 
             <p className="pub-auth-legal">
               {isSignUp ? 'No credit card required. ' : ''}
