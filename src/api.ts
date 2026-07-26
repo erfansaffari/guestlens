@@ -4,11 +4,11 @@ export type Field = { value: string; source: string; confidence: 'high' | 'mediu
 export type Candidate = { id: string; url: string; title: string; snippet: string; thumbnailUrl?: string; score: number; rank: number; evidence: Record<string, unknown>; fields: Record<string, Field> }
 export type Person = { id: string; displayName: string; status: 'pending' | 'processing' | 'resolved' | 'ambiguous' | 'not_found' | 'failed' | 'budget_paused'; confidence: string | null; matchScore: number | null; linkedinUrl: string | null; profile: Record<string, Field | undefined>; userConfirmed: boolean; candidates: Candidate[] }
 export type EventAttendee = { attendeeId: string; originalName: string; person: Person }
-export type AttendeesResponse = { event: { id: string; name: string; context: string | null }; page: number; limit: number; total: number; attendees: EventAttendee[] }
+export type AttendeesResponse = { event: { id: string; name: string; context: string | null; eventLink: string | null }; page: number; limit: number; total: number; attendees: EventAttendee[] }
 export type Progress = { total: number; resolved: number; ambiguous: number; notFound: number; pending: number; failed: number; budgetPaused: number }
 export type AskResponse = { answer: string; matches: Array<{ personId: string; reason: string }> }
 export type DashboardSummary = { events: number; people: number; resolved: number; repeats: number }
-export type EventSummary = { id: string; name: string; context: string | null; createdAt: string; updatedAt: string; people: number; resolved: number }
+export type EventSummary = { id: string; name: string; context: string | null; eventLink: string | null; createdAt: string; updatedAt: string; people: number; resolved: number }
 export type NetworkPerson = { identity_key: string; displayName: string; linkedinUrl: string | null; profile: Record<string, Field>; resolved: boolean; eventCount: number; events: Array<{ id: string; name: string }>; identityConfidence: 'high' | 'low' }
 
 async function request<T>(path: string, token: string | null, init?: RequestInit): Promise<T> {
@@ -18,8 +18,8 @@ async function request<T>(path: string, token: string | null, init?: RequestInit
   return body
 }
 
-export function importEvent(token: string | null, eventName: string, attendees: Attendee[], eventContext?: string) {
-  return request<{ eventId: string; total: number; cached: number; queued: number }>('/api/events/import', token, { method: 'POST', body: JSON.stringify({ eventName, eventContext, attendees: attendees.map((attendee) => ({ id: attendee.id, fullName: attendee.fullName })) }) })
+export function importEvent(token: string | null, eventName: string, attendees: Attendee[], eventContext?: string, eventLink?: string) {
+  return request<{ eventId: string; total: number; cached: number; queued: number }>('/api/events/import', token, { method: 'POST', body: JSON.stringify({ eventName, eventLink, eventContext, attendees: attendees.map((attendee) => ({ id: attendee.id, fullName: attendee.fullName })) }) })
 }
 export function getAttendees(token: string | null, eventId: string, page = 1) { return request<AttendeesResponse>(`/api/events/${eventId}/attendees?page=${page}&limit=50`, token) }
 export function getProgress(token: string | null, eventId: string) { return request<Progress>(`/api/events/${eventId}/progress`, token) }

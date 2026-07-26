@@ -11,6 +11,7 @@ export const events = pgTable('events', {
   ownerId: text('owner_id').notNull(),
   name: text('name').notNull(),
   context: text('context'),
+  eventLink: text('event_link'),
   deletedAt: timestamp('deleted_at', { withTimezone: true }),
   ...timestamps,
 }, (table) => [index('events_owner_idx').on(table.ownerId)])

@@ -25,7 +25,7 @@ app.use(clerkMiddleware({
 }))
 app.use('/api', rateLimit({ windowMs: 60_000, limit: Number(process.env.API_REQUESTS_PER_MINUTE || 120), standardHeaders: 'draft-8', legacyHeaders: false }))
 
-const importSchema = z.object({ eventName: z.string().trim().min(1).max(200), eventContext: z.string().trim().max(300).optional(), attendees: z.array(z.object({ id: z.string().optional(), fullName: z.string().trim().min(1).max(160) })).min(1).max(Number(process.env.MAX_ATTENDEES_PER_IMPORT || 500)) })
+const importSchema = z.object({ eventName: z.string().trim().min(1).max(200), eventLink: z.string().url().max(2_000).optional().or(z.literal('')), eventContext: z.string().trim().max(300).optional(), attendees: z.array(z.object({ id: z.string().optional(), fullName: z.string().trim().min(1).max(160) })).min(1).max(Number(process.env.MAX_ATTENDEES_PER_IMPORT || 500)) })
 const confirmSchema = z.object({ candidateId: z.string().uuid().optional(), linkedinUrl: z.string().url().optional() }).refine((value) => value.candidateId || value.linkedinUrl, 'Select a candidate or provide a LinkedIn URL.')
 const askSchema = z.object({ question: z.string().trim().min(3).max(500) })
 const askResultSchema = z.object({ answer: z.string().trim().min(1).max(1_200), matches: z.array(z.object({ personId: z.string().uuid(), reason: z.string().trim().min(1).max(240) })).max(20) })
@@ -61,8 +61,8 @@ app.get('/api/dashboard', async (req, res) => {
 app.get('/api/events', async (req, res) => {
   const ownerId = requireUser(req, res); if (!ownerId) return
   const page = Math.max(1, Number(req.query.page || 1)); const limit = Math.min(50, Math.max(1, Number(req.query.limit || 20))); const offset = (page - 1) * limit
-  const rows = await db().execute<{ id: string; name: string; context: string | null; createdAt: string; updatedAt: string; people: number; resolved: number }>(sql`
-    SELECT e.id, e.name, e.context, e.created_at AS "createdAt", e.updated_at AS "updatedAt", count(ea.id)::int AS people, count(ea.id) FILTER (WHERE p.status = 'resolved')::int AS resolved FROM events e LEFT JOIN event_attendees ea ON ea.event_id = e.id LEFT JOIN people p ON p.id = ea.person_id WHERE e.owner_id = ${ownerId} AND e.deleted_at IS NULL GROUP BY e.id ORDER BY e.updated_at DESC LIMIT ${limit} OFFSET ${offset}
+  const rows = await db().execute<{ id: string; name: string; context: string | null; eventLink: string | null; createdAt: string; updatedAt: string; people: number; resolved: number }>(sql`
+    SELECT e.id, e.name, e.context, e.event_link AS "eventLink", e.created_at AS "createdAt", e.updated_at AS "updatedAt", count(ea.id)::int AS people, count(ea.id) FILTER (WHERE p.status = 'resolved')::int AS resolved FROM events e LEFT JOIN event_attendees ea ON ea.event_id = e.id LEFT JOIN people p ON p.id = ea.person_id WHERE e.owner_id = ${ownerId} AND e.deleted_at IS NULL GROUP BY e.id ORDER BY e.updated_at DESC LIMIT ${limit} OFFSET ${offset}
   `)
   res.json({ page, limit, events: rows })
 })
@@ -84,7 +84,7 @@ app.post('/api/events/import', importLimiter, async (req, res) => {
   const parsed = importSchema.safeParse(req.body); if (!parsed.success) { res.status(400).json({ error: parsed.error.flatten() }); return }
   try {
     const seen = new Set<string>(); const attendees = parsed.data.attendees.filter((attendee) => { const key = normaliseName(attendee.fullName); if (!key || seen.has(key)) return false; seen.add(key); return true })
-    const database = db(); const [event] = await database.insert(events).values({ ownerId, name: parsed.data.eventName, context: parsed.data.eventContext, updatedAt: new Date() }).returning()
+    const database = db(); const [event] = await database.insert(events).values({ ownerId, name: parsed.data.eventName, eventLink: parsed.data.eventLink || null, context: parsed.data.eventContext, updatedAt: new Date() }).returning()
     const names = attendees.map((attendee) => normaliseName(attendee.fullName)); const now = new Date()
     const resolutions = names.length ? await database.select().from(nameResolutions).where(and(inArray(nameResolutions.normalisedName, names), or(isNull(nameResolutions.expiresAt), gt(nameResolutions.expiresAt, now)))) : []
     const resolutionByName = new Map(resolutions.map((resolution) => [resolution.normalisedName, resolution])); const urls = resolutions.flatMap((resolution) => resolution.linkedinUrl ? [resolution.linkedinUrl] : [])
@@ -113,7 +113,7 @@ app.get('/api/events/:eventId/attendees', async (req, res) => {
   const rows = await db().select({ attendee: eventAttendees, person: people }).from(eventAttendees).innerJoin(people, eq(eventAttendees.personId, people.id)).where(eq(eventAttendees.eventId, event.id)).orderBy(asc(eventAttendees.ordinal)).limit(limit).offset(offset)
   const ids = rows.map((row) => row.person.id); const candidates = ids.length ? await db().select().from(searchCandidates).where(inArray(searchCandidates.personId, ids)).orderBy(asc(searchCandidates.rank)) : []
   const totalResult = await db().select({ total: count() }).from(eventAttendees).where(eq(eventAttendees.eventId, event.id))
-  res.json({ event: { id: event.id, name: event.name, context: event.context }, page, limit, total: totalResult[0]?.total || 0, attendees: rows.map(({ attendee, person }) => ({ attendeeId: attendee.id, originalName: attendee.originalName, person: profileResponse(person, candidates.filter((candidate) => candidate.personId === person.id)) })) })
+  res.json({ event: { id: event.id, name: event.name, context: event.context, eventLink: event.eventLink }, page, limit, total: totalResult[0]?.total || 0, attendees: rows.map(({ attendee, person }) => ({ attendeeId: attendee.id, originalName: attendee.originalName, person: profileResponse(person, candidates.filter((candidate) => candidate.personId === person.id)) })) })
 })
 
 app.get('/api/events/:eventId/progress', async (req, res) => {
